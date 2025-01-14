@@ -474,7 +474,7 @@ func main() {
 
 	err = storage.hydrateEverything()
 	if err != nil {
-		panic(err)
+		panic(fmt.Errorf("Error hydrating everything: %v", err))
 	}
 
 	// Create Gin router
