@@ -2,20 +2,29 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/bluesky-social/indigo/api/bsky"
+	"github.com/bluesky-social/indigo/api/chat"
 	"github.com/gin-gonic/gin"
+	gonanoid "github.com/matoous/go-nanoid"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 type Config struct {
-	ServerURL string `json:"server_url"`
-	Port      string `json:"port"`
+	ServerURL  string
+	Port       string
+	DBPath     string
+	AppviewURL string
 }
 
 type DIDDocument struct {
@@ -90,11 +99,382 @@ func requestDebugMiddleware() gin.HandlerFunc {
 	}
 }
 
+type Storage struct {
+	db         *sql.DB
+	appviewUrl string
+}
+
+func (st Storage) hydrateEverything() error {
+	rows, err := st.db.Query("SELECT user_did FROM convo_members")
+	if err != nil {
+		return fmt.Errorf("error querying convo_members: %w", err)
+	}
+	for rows.Next() {
+		var did string
+		err = rows.Scan(&did)
+		if err != nil {
+			return fmt.Errorf("error fetching did: %w", err)
+		}
+		var handle string
+		err = st.db.QueryRow("SELECT handle FROM users WHERE did = ?", did).Scan(&handle)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				// fetch from appview
+				req, err := http.NewRequest("GET", fmt.Sprintf("%s/xrpc/app.bsky.actor.getProfile?actor=%s", st.appviewUrl, did), nil)
+				if err != nil {
+					return fmt.Errorf("error creating request: %w", err)
+				}
+				res, err := http.DefaultClient.Do(req)
+				if err != nil {
+					return fmt.Errorf("error executing request: %w", err)
+				}
+				if res.StatusCode != http.StatusOK {
+					return fmt.Errorf("appview returned not 200, got %d", res.StatusCode)
+				}
+				body, err := io.ReadAll(res.Body)
+				if err != nil {
+					return fmt.Errorf("error reading response body: %w", err)
+				}
+				var profile map[string]any
+				err = json.Unmarshal(body, &profile)
+				if err != nil {
+					return fmt.Errorf("error parsing response body: %w", err)
+				}
+				handle = profile["handle"].(string)
+				_, err = st.db.Exec("INSERT INTO users (did, handle) VALUES (?, ?)", did, handle)
+				if err != nil {
+					return fmt.Errorf("error inserting user: %w", err)
+				}
+			} else {
+				return fmt.Errorf("error fetching handle: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+type ConvoMessage struct {
+	ConvoID     string
+	AuthorDID   string
+	ID          string
+	SentAt      time.Time
+	Deleted     bool
+	MessageData ConvoMessageData
+}
+
+type ConvoMessageData struct {
+	Text   string                `json:"text"`
+	Facets []*bsky.RichtextFacet `json:"facets"`
+}
+
+func (cm ConvoMessage) asDeleted() *chat.ConvoDefs_DeletedMessageView {
+	return &chat.ConvoDefs_DeletedMessageView{
+		Id:     cm.ID,
+		Rev:    "aaa",
+		Sender: &chat.ConvoDefs_MessageViewSender{Did: cm.AuthorDID},
+		SentAt: cm.SentAt.Format(time.RFC3339),
+	}
+}
+func (cm ConvoMessage) asMessage() *chat.ConvoDefs_MessageView {
+	return &chat.ConvoDefs_MessageView{
+		Id:     cm.ID,
+		Rev:    "aaa",
+		Sender: &chat.ConvoDefs_MessageViewSender{Did: cm.AuthorDID},
+		SentAt: cm.SentAt.Format(time.RFC3339),
+		Embed:  nil,
+		Text:   cm.MessageData.Text,
+		Facets: cm.MessageData.Facets,
+	}
+}
+
+func (st Storage) getMessage(convoID string, messageID string) (*ConvoMessage, error) {
+	row := st.db.QueryRow("SELECT author_did, sent_at, data, deleted FROM convo_messages WHERE convo_id = ? AND message_id = ?", convoID, messageID)
+	var m ConvoMessage
+	m.ConvoID = convoID
+	m.ID = messageID
+	var mJSON string
+	var sentAt int64
+	err := row.Scan(&m.AuthorDID, &mJSON, &sentAt, &m.Deleted)
+	if err != nil {
+		return nil, fmt.Errorf("error querying message: %w", err)
+	}
+	m.SentAt = time.Unix(sentAt, 0)
+	if !m.Deleted {
+		err = json.Unmarshal([]byte(mJSON), &m.MessageData)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing message data: %w", err)
+		}
+	}
+	return &m, nil
+}
+
+func randomId() string {
+	return gonanoid.MustGenerate("abcdefghimnopqrstuvwxyz123456", 20)
+}
+
+func (st Storage) createConvo(members []string) (*chat.ConvoDefs_ConvoView, error) {
+	id := randomId()
+	tx, err := st.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		}
+	}()
+
+	_, err = tx.Exec(`INSERT INTO convos (id, rev, last_message_id) VALUES (?, ?, ?)`, id, "whatever", nil)
+	if err != nil {
+		return nil, fmt.Errorf("error inserting convo: %w", err)
+	}
+
+	for _, memberDid := range members {
+		_, err = tx.Exec(`INSERT INTO convo_members (convo_id, user_did) VALUES (?, ?)`, id, memberDid)
+		if err != nil {
+			return nil, fmt.Errorf("error inserting convo member: %w", err)
+		}
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return nil, fmt.Errorf("error committing tx: %w", err)
+	}
+
+	err = st.hydrateEverything()
+	if err != nil {
+		return nil, fmt.Errorf("error rehydrating inner users: %w", err)
+	}
+	return st.getConvo(members[0], id)
+
+}
+func (st Storage) getConvo(userDID, convoID string) (*chat.ConvoDefs_ConvoView, error) {
+	convos, err := st.getAllConvos(userDID)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range convos {
+		if c.Id == convoID {
+			return c, nil
+		}
+	}
+	return nil, nil
+}
+
+func (st Storage) getAllConvos(userDID string) ([]*chat.ConvoDefs_ConvoView, error) {
+	rows, err := st.db.Query("SELECT convo_id FROM convo_members WHERE user_did = ?", userDID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	views := make([]*chat.ConvoDefs_ConvoView, 0)
+	for rows.Next() {
+		view := chat.ConvoDefs_ConvoView{}
+		err = rows.Scan(&view.Id)
+		if err != nil {
+			return nil, fmt.Errorf("error scanning convos: %w", err)
+		}
+		views = append(views, &view)
+	}
+
+	for _, view := range views {
+		var lastMessageId *string
+		row := st.db.QueryRow("SELECT rev, last_message_id FROM convos WHERE id = ?", view.Id)
+		if err != nil {
+			return nil, fmt.Errorf("failed to query single convo row: %w", err)
+		}
+		err = row.Scan(&view.Rev, &lastMessageId)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan convo data: %w", err)
+		}
+		rows, err := st.db.Query("SELECT user_did, muted, unread_count FROM convo_members WHERE convo_id = ?", view.Id)
+		if err != nil {
+			return nil, fmt.Errorf("Failed to query members: %w", err)
+		}
+		defer rows.Close()
+		members := make([]string, 0)
+		for rows.Next() {
+			var did string
+			var muted bool
+			var unreadCount int64
+			err := rows.Scan(&did, &muted, &unreadCount)
+			if err != nil {
+				return nil, fmt.Errorf("Failed to scan user did for member list: %v", err)
+			}
+			members = append(members, did)
+			var handle string
+			err = st.db.QueryRow("SELECT handle FROM users WHERE did = ?", did).Scan(&handle)
+			if err != nil {
+				return nil, fmt.Errorf("Failed to scan user handle for member list: %v", err)
+			}
+			view.Members = append(view.Members, &chat.ActorDefs_ProfileViewBasic{
+				Did:    did,
+				Handle: handle,
+			})
+
+			if did == userDID {
+				// muted and unread is per-did
+				view.Muted = muted
+				view.UnreadCount = unreadCount
+			}
+			if lastMessageId != nil {
+				m, err := st.getMessage(view.Id, *lastMessageId)
+				if err != nil {
+					return nil, fmt.Errorf("Failed to get message for member: %v", err)
+				}
+				if m.Deleted {
+					view.LastMessage.ConvoDefs_DeletedMessageView = m.asDeleted()
+				} else {
+					view.LastMessage.ConvoDefs_MessageView = m.asMessage()
+				}
+			}
+		}
+	}
+	v, err := json.Marshal(views)
+	fmt.Println(string(v))
+	return views, nil
+}
+
+type State struct {
+	storage *Storage
+}
+
+func (s State) listConvos(c *gin.Context) {
+	userDID := c.GetString("user_did")
+	convos, err := s.storage.getAllConvos(userDID)
+	if err != nil {
+		c.AbortWithError(http.StatusInternalServerError, err)
+		return
+	}
+	out := chat.ConvoListConvos_Output{Convos: convos}
+	c.JSON(200, out)
+}
+
+func (s State) getConvo(c *gin.Context) {
+	userDID := c.GetString("user_did")
+	convoID := c.Query("convoId")
+	convo, err := s.storage.getConvo(userDID, convoID)
+	if err != nil {
+		c.AbortWithError(http.StatusInternalServerError, err)
+		return
+	}
+	out := chat.ConvoGetConvo_Output{}
+	out.Convo = convo
+	c.JSON(200, out)
+}
+
+func (s State) getConvoForMembers(c *gin.Context) {
+	userDID := c.GetString("user_did")
+	memberDIDs := c.QueryArray("members")
+	memberDIDs = append(memberDIDs, userDID)
+	out := chat.ConvoGetConvoForMembers_Output{}
+	convos, err := s.storage.getAllConvos(userDID)
+	if err != nil {
+		c.AbortWithError(http.StatusInternalServerError, err)
+		return
+	}
+	for _, convo := range convos {
+		containsAllMembersExactly := true
+		for _, member := range convo.Members {
+			if len(convo.Members) != len(memberDIDs) {
+				containsAllMembersExactly = false
+			}
+			for _, memberDID := range memberDIDs {
+				if member.Did != memberDID {
+					containsAllMembersExactly = false
+				}
+			}
+		}
+		if containsAllMembersExactly {
+			out.Convo = convo
+			break
+		}
+	}
+	if out.Convo == nil {
+		// create convo automatically
+		newConvo, err := s.storage.createConvo(memberDIDs)
+		if err != nil {
+			c.AbortWithError(http.StatusInternalServerError, err)
+			return
+		}
+		out.Convo = newConvo
+	}
+	c.JSON(200, out)
+}
+func (s State) getLog(c *gin.Context) {
+	_ = c.GetString("user_did")
+	out := chat.ConvoGetLog_Output{}
+	c.JSON(200, out)
+}
+
 func main() {
 	// Initialize configuration
 	config := Config{
-		ServerURL: getEnvOrDefault("SERVER_URL", "localhost:3000"),
-		Port:      getEnvOrDefault("PORT", "3000"),
+		ServerURL:  getEnvOrDefault("SERVER_URL", "localhost:3000"),
+		Port:       getEnvOrDefault("PORT", "3000"),
+		DBPath:     getEnvOrDefault("DB_PATH", "data.db"),
+		AppviewURL: getEnvOrDefault("APPVIEW_URL", ""),
+	}
+
+	db, err := sql.Open("sqlite3", config.DBPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec(`
+	PRAGMA journal_mode=WAL;
+	PRAGMA busy_timeout = 5000;
+	PRAGMA synchronous = NORMAL;
+	PRAGMA cache_size = 1000000000;
+	PRAGMA foreign_keys = true;
+	PRAGMA temp_store = memory;
+
+	CREATE TABLE IF NOT EXISTS users (
+		did text primary key,
+		handle text
+	) STRICT;
+
+	CREATE TABLE IF NOT EXISTS convos (
+		id text primary key,
+		rev text,
+		last_message_id text
+	) STRICT;
+
+	CREATE TABLE IF NOT EXISTS convo_members (
+		convo_id text,
+		user_did text,
+		unread_count int default 0,
+		muted int default 0,
+		primary key (convo_id, user_did)
+	) STRICT;
+
+	CREATE TABLE IF NOT EXISTS convo_logs (
+		convo_id text,
+		user_did text,
+		cursor int,
+		data text -- json encoded
+	) STRICT;
+	CREATE TABLE IF NOT EXISTS convo_messages (
+		convo_id text,
+		message_id text,
+		author_did text,
+		sent_at int,
+		cursor int,
+		data text, -- json encoded
+		primary key (convo_id, message_id)
+	) STRICT;
+	`)
+	if err != nil {
+		log.Fatalf("Error creating tables: %v", err)
+	}
+
+	storage := Storage{db: db, appviewUrl: config.AppviewURL}
+	state := State{storage: &storage}
+
+	err = storage.hydrateEverything()
+	if err != nil {
+		panic(err)
 	}
 
 	// Create Gin router
@@ -117,7 +497,10 @@ func main() {
 	}
 	authGroup := r.Group("/")
 	authGroup.Use(auther.AuthenticateGinRequestViaJWT)
-	authGroup.GET("/xrpc/chat.bsky.convo.listConvos", listConvos)
+	authGroup.GET("/xrpc/chat.bsky.convo.listConvos", state.listConvos)
+	authGroup.GET("/xrpc/chat.bsky.convo.getConvoForMembers", state.getConvoForMembers)
+	authGroup.GET("/xrpc/chat.bsky.convo.getConvo", state.getConvo)
+	authGroup.GET("/xrpc/chat.bsky.convo.getLog", state.getLog)
 
 	// Routes
 	r.GET("/", func(c *gin.Context) {
@@ -134,12 +517,6 @@ func main() {
 	addr := ":" + config.Port
 	fmt.Printf("Server starting on %s\n", addr)
 	r.Run(addr)
-}
-
-func listConvos(c *gin.Context) {
-	c.JSON(200, map[string]any{
-		"convos": []any{},
-	})
 }
 
 func getEnvOrDefault(key, defaultValue string) string {
