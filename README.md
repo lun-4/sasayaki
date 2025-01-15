@@ -5,6 +5,8 @@ unofficial implementation of the bluesky dm service, for the bit
 useful to AppViews that are based off the main bluesky appview.
 
 keep in mind that at the moment (january 2025), bsky chat is a centralized service living on https://api.bsky.chat.
+in turn, to make this work within the atproto mainnet, you and your friends need to use the same build of social-app
+that uses your own dm service. more information in the **how** section
 
 ![screenshot of it working](https://smooch.computer/i/9sem1xrewiu5k.png)
 
