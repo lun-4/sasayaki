@@ -357,7 +357,12 @@ func (st Storage) getMessages(convoId string, limit int64, cursorString string) 
 	} else {
 		cursor = math.MaxInt64
 	}
-	rows, err := st.db.Query("SELECT message_id FROM convo_messages WHERE convo_id = ? AND cursor < ? LIMIT ?", convoId, cursor, limit)
+	rows, err := st.db.Query(`SELECT message_id
+		FROM convo_messages
+		WHERE convo_id = ?
+			AND cursor < ?
+		ORDER BY cursor DESC
+		LIMIT ?`, convoId, cursor, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query messages: %v", err)
 	}
