@@ -24,4 +24,6 @@ env APPVIEW_URL=https://appview.example.net \
 
 then set chat.example.net as the XRPC service inside social-app, this requires social-app patches.
 
+`EXPO_PUBLIC_BSKY_CHAT_DID_REFERENCE=did:web:chat.example.net#bsky_chat`
+
 more info on: https://l4.pm/wiki/Personal%20Wiki/bluesky/bsky%20independent%20appview/a%20step%20by%20step%20process%20into%20an%20appview.html#social-app
