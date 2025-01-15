@@ -166,8 +166,9 @@ type ConvoMessage struct {
 }
 
 type ConvoMessageData struct {
-	Text   string                `json:"text"`
-	Facets []*bsky.RichtextFacet `json:"facets"`
+	Text   string                        `json:"text"`
+	Facets []*bsky.RichtextFacet         `json:"facets"`
+	Embed  *bsky.EmbedRecord_View_Record `json:"embed"`
 }
 
 func (cm ConvoMessage) asDeleted() *chat.ConvoDefs_DeletedMessageView {
