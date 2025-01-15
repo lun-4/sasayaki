@@ -20,6 +20,7 @@ import (
 	"github.com/gin-gonic/gin"
 	gonanoid "github.com/matoous/go-nanoid"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/samber/lo"
 )
 
 type Config struct {
@@ -170,6 +171,9 @@ type ConvoMessageData struct {
 }
 
 func (cm ConvoMessage) asDeleted() *chat.ConvoDefs_DeletedMessageView {
+	if !cm.Deleted {
+		panic("ConvoMessage is not deleted")
+	}
 	return &chat.ConvoDefs_DeletedMessageView{
 		Id:     cm.ID,
 		Rev:    "aaa",
@@ -178,6 +182,9 @@ func (cm ConvoMessage) asDeleted() *chat.ConvoDefs_DeletedMessageView {
 	}
 }
 func (cm ConvoMessage) asMessage() *chat.ConvoDefs_MessageView {
+	if cm.Deleted {
+		panic("can't call asMessage on a deleted message")
+	}
 	return &chat.ConvoDefs_MessageView{
 		Id:     cm.ID,
 		Rev:    "aaa",
@@ -190,7 +197,7 @@ func (cm ConvoMessage) asMessage() *chat.ConvoDefs_MessageView {
 }
 
 func (st Storage) getMessage(convoID string, messageID string) (*ConvoMessage, error) {
-	row := st.db.QueryRow("SELECT author_did, sent_at, data, deleted FROM convo_messages WHERE convo_id = ? AND message_id = ?", convoID, messageID)
+	row := st.db.QueryRow("SELECT author_did, data, sent_at, deleted FROM convo_messages WHERE convo_id = ? AND message_id = ?", convoID, messageID)
 	var m ConvoMessage
 	m.ConvoID = convoID
 	m.ID = messageID
@@ -324,6 +331,8 @@ func (st Storage) getAllConvos(userDID string) ([]*chat.ConvoDefs_ConvoView, err
 				if err != nil {
 					return nil, fmt.Errorf("Failed to get message for member: %v", err)
 				}
+
+				view.LastMessage = &chat.ConvoDefs_ConvoView_LastMessage{}
 				if m.Deleted {
 					view.LastMessage.ConvoDefs_DeletedMessageView = m.asDeleted()
 				} else {
@@ -387,6 +396,53 @@ func (st Storage) getMessages(convoId string, limit int64, cursorString string) 
 		Cursor:   &smallestId,
 		Messages: msgView,
 	}, nil
+}
+
+func (st Storage) createMessage(convoID, userDID string, message *chat.ConvoDefs_MessageInput) (*ConvoMessage, error) {
+	id := randomId()
+	tx, err := st.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		}
+	}()
+
+	msgData, err := json.Marshal(message)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal message: %v", err)
+	}
+
+	var maxCursor *int64
+	err = tx.QueryRow(`SELECT MAX(cursor) FROM convo_messages WHERE convo_id = ?`, convoID).Scan(&maxCursor)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal message: %v", err)
+	}
+
+	if maxCursor == nil {
+		maxCursor = lo.ToPtr(int64(0))
+	}
+
+	_, err = tx.Exec(`INSERT INTO convo_messages
+		(convo_id, message_id, author_did, sent_at, cursor, data, deleted) 
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, convoID, id, userDID, time.Now().Unix(), (*maxCursor)+1, string(msgData), false)
+	if err != nil {
+		return nil, fmt.Errorf("error inserting message: %w", err)
+	}
+
+	_, err = tx.Exec(`UPDATE convos SET last_message_id = ? WHERE id = ?`, id, convoID)
+	if err != nil {
+		return nil, fmt.Errorf("error updating convo: %w", err)
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return nil, fmt.Errorf("error committing tx: %w", err)
+	}
+
+	return st.getMessage(convoID, id)
 }
 
 type State struct {
@@ -529,6 +585,29 @@ func (s State) getMessages(c *gin.Context) {
 	c.JSON(200, out)
 }
 
+func (s State) sendMessage(c *gin.Context) {
+	userDID := c.GetString("user_did")
+
+	var input chat.ConvoSendMessage_Input
+	v, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.AbortWithError(http.StatusInternalServerError, err)
+		return
+	}
+	err = json.Unmarshal(v, &input)
+	if err != nil {
+		c.AbortWithError(http.StatusBadRequest, err)
+		return
+	}
+	m, err := s.storage.createMessage(input.ConvoId, userDID, input.Message)
+	if err != nil {
+		c.AbortWithError(http.StatusInternalServerError, err)
+		return
+	}
+
+	c.JSON(200, m.asMessage())
+}
+
 func main() {
 	// Initialize configuration
 	config := Config{
@@ -583,6 +662,7 @@ func main() {
 		author_did text,
 		sent_at int,
 		cursor int,
+		deleted int,
 		data text, -- json encoded
 		primary key (convo_id, message_id)
 	) STRICT;
@@ -627,6 +707,7 @@ func main() {
 	authGroup.GET("/xrpc/chat.bsky.convo.getLog", state.getLog)
 	authGroup.GET("/xrpc/chat.bsky.convo.getMessages", state.getMessages)
 	authGroup.POST("/xrpc/chat.bsky.convo.updateRead", state.updateRead)
+	authGroup.POST("/xrpc/chat.bsky.convo.sendMessage", state.sendMessage)
 
 	// Routes
 	r.GET("/", func(c *gin.Context) {
