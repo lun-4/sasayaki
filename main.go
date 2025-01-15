@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -335,6 +337,58 @@ func (st Storage) getAllConvos(userDID string) ([]*chat.ConvoDefs_ConvoView, err
 	return views, nil
 }
 
+func (st Storage) getMessages(convoId string, limit int64, cursorString string) (*chat.ConvoGetMessages_Output, error) {
+	var cursor int64
+	if cursorString != "" {
+		cursorP, err := strconv.ParseInt(cursorString, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse cursor: %v", err)
+		}
+		cursor = cursorP
+	} else {
+		cursor = math.MaxInt64
+	}
+	rows, err := st.db.Query("SELECT message_id FROM convo_messages WHERE convo_id = ? AND cursor < ? LIMIT ?", convoId, cursor, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query messages: %v", err)
+	}
+	defer rows.Close()
+	msgs := make([]*ConvoMessage, 0)
+	var smallestId string
+	for rows.Next() {
+		var msgId string
+		err = rows.Scan(&msgId)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch message id: %v", err)
+		}
+		msg, err := st.getMessage(convoId, msgId)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch message id %s: %v", msgId, err)
+		}
+		if msg.ID < smallestId {
+			smallestId = msg.ID
+		}
+		msgs = append(msgs, msg)
+	}
+	msgView := make([]*chat.ConvoGetMessages_Output_Messages_Elem, 0)
+	for _, m := range msgs {
+		if m.Deleted {
+			msgView = append(msgView, &chat.ConvoGetMessages_Output_Messages_Elem{
+				ConvoDefs_DeletedMessageView: m.asDeleted(),
+			})
+		} else {
+			msgView = append(msgView, &chat.ConvoGetMessages_Output_Messages_Elem{
+				ConvoDefs_MessageView: m.asMessage(),
+			})
+		}
+	}
+
+	return &chat.ConvoGetMessages_Output{
+		Cursor:   &smallestId,
+		Messages: msgView,
+	}, nil
+}
+
 type State struct {
 	storage *Storage
 }
@@ -402,8 +456,76 @@ func (s State) getConvoForMembers(c *gin.Context) {
 	c.JSON(200, out)
 }
 func (s State) getLog(c *gin.Context) {
-	_ = c.GetString("user_did")
-	out := chat.ConvoGetLog_Output{}
+	userDID := c.GetString("user_did")
+	convos, err := s.storage.getAllConvos(userDID)
+	if err != nil {
+		c.AbortWithError(http.StatusInternalServerError, err)
+		return
+	}
+	out := chat.ConvoGetLog_Output{
+		Logs: make([]*chat.ConvoGetLog_Output_Logs_Elem, 0),
+	}
+	for _, convo := range convos {
+		out.Logs = append(out.Logs, &chat.ConvoGetLog_Output_Logs_Elem{
+			ConvoDefs_LogBeginConvo: &chat.ConvoDefs_LogBeginConvo{
+				ConvoId: convo.Id,
+				Rev:     convo.Rev,
+			},
+		})
+	}
+	c.JSON(200, out)
+}
+
+func (s State) updateRead(c *gin.Context) {
+	userDID := c.GetString("user_did")
+	var input chat.ConvoUpdateRead_Input
+	v, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.AbortWithError(http.StatusInternalServerError, err)
+		return
+	}
+	err = json.Unmarshal(v, &input)
+	if err != nil {
+		c.AbortWithError(http.StatusBadRequest, err)
+		return
+	}
+	convo, err := s.storage.getConvo(userDID, input.ConvoId)
+	if err != nil {
+		c.AbortWithError(http.StatusInternalServerError, err)
+		return
+	}
+
+	c.JSON(200, chat.ConvoUpdateRead_Output{Convo: convo})
+}
+
+func (s State) getMessages(c *gin.Context) {
+	userDID := c.GetString("user_did")
+	convoID := c.Query("convoId")
+	limitStr := c.Query("limit")
+	cursor := c.Query("cursor")
+	if limitStr == "" {
+		limitStr = "10"
+	}
+	limit, err := strconv.ParseInt(limitStr, 10, 64)
+	if err != nil {
+		c.AbortWithError(http.StatusInternalServerError, err)
+		return
+	}
+	convo, err := s.storage.getConvo(userDID, convoID)
+	if err != nil {
+		c.AbortWithError(http.StatusInternalServerError, err)
+		return
+	}
+	if convo == nil {
+		c.AbortWithError(http.StatusForbidden, fmt.Errorf("Convo not found"))
+		return
+	}
+	out, err := s.storage.getMessages(convoID, limit, cursor)
+	if err != nil {
+		c.AbortWithError(http.StatusInternalServerError, err)
+		return
+	}
+
 	c.JSON(200, out)
 }
 
@@ -464,6 +586,8 @@ func main() {
 		data text, -- json encoded
 		primary key (convo_id, message_id)
 	) STRICT;
+	CREATE INDEX IF NOT EXISTS convo_messages_convo_id on convo_messages (convo_id);
+	CREATE INDEX IF NOT EXISTS convo_messages_convo_id_cursor on convo_messages (convo_id, cursor);
 	`)
 	if err != nil {
 		log.Fatalf("Error creating tables: %v", err)
@@ -501,6 +625,8 @@ func main() {
 	authGroup.GET("/xrpc/chat.bsky.convo.getConvoForMembers", state.getConvoForMembers)
 	authGroup.GET("/xrpc/chat.bsky.convo.getConvo", state.getConvo)
 	authGroup.GET("/xrpc/chat.bsky.convo.getLog", state.getLog)
+	authGroup.GET("/xrpc/chat.bsky.convo.getMessages", state.getMessages)
+	authGroup.POST("/xrpc/chat.bsky.convo.updateRead", state.updateRead)
 
 	// Routes
 	r.GET("/", func(c *gin.Context) {
