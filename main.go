@@ -56,52 +56,6 @@ func newDIDDocument(serverURL string) DIDDocument {
 	}
 }
 
-func requestDebugMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		// Get the raw request body
-		var bodyBytes []byte
-		if c.Request.Body != nil {
-			bodyBytes, _ = io.ReadAll(c.Request.Body)
-			// Restore the body for later middleware/handlers
-			c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-		}
-
-		// Print request details
-		fmt.Printf("\n==== Incoming Request ====\n")
-		fmt.Printf("Method: %s\n", c.Request.Method)
-		fmt.Printf("URL: %s\n", c.Request.URL.String())
-
-		// Print headers
-		fmt.Println("\nHeaders:")
-		for name, values := range c.Request.Header {
-			fmt.Printf("%s: %s\n", name, strings.Join(values, ", "))
-		}
-
-		// Print query parameters
-		fmt.Println("\nQuery Parameters:")
-		for key, values := range c.Request.URL.Query() {
-			fmt.Printf("%s: %s\n", key, strings.Join(values, ", "))
-		}
-
-		// Print body if exists
-		if len(bodyBytes) > 0 {
-			fmt.Println("\nBody:")
-			// Try to pretty print JSON
-			var prettyJSON bytes.Buffer
-			if err := json.Indent(&prettyJSON, bodyBytes, "", "  "); err == nil {
-				fmt.Println(prettyJSON.String())
-			} else {
-				// If not JSON, print raw body
-				fmt.Println(string(bodyBytes))
-			}
-		}
-
-		fmt.Println("\n========================")
-
-		c.Next()
-	}
-}
-
 type Storage struct {
 	db         *sql.DB
 	appviewUrl string
@@ -743,7 +697,6 @@ func main() {
 	// Middleware
 	r.Use(gin.Recovery())
 	r.Use(gin.Logger())
-	r.Use(requestDebugMiddleware())
 
 	serviceWebDID := "did:web:" + config.ServerURL
 	auther, err := NewAuth(
