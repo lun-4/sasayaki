@@ -18,6 +18,7 @@ cd sasayaki
 env APPVIEW_URL=https://appview.example.net \
 	ATPROTO_PLC_URL=https://plc.example.net \
 	SERVER_URL=chat.example.net \
+	DB_PATH=data.db \
 	PORT=43091 go run .
 ```
 
