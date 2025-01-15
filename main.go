@@ -442,12 +442,56 @@ func (st Storage) createMessage(convoID, userDID string, message *chat.ConvoDefs
 		return nil, fmt.Errorf("error updating convo: %w", err)
 	}
 
+	rows, err := tx.Query(`SELECT user_did FROM convo_members WHERE convo_id = ?`, convoID)
+	if err != nil {
+		return nil, fmt.Errorf("error init query for member unread: %w", err)
+	}
+	for rows.Next() {
+		var memberDID string
+		err = rows.Scan(&memberDID)
+		if err != nil {
+			return nil, fmt.Errorf("error scan query for member unread: %w", err)
+		}
+		// only incr unread for non-author
+		if memberDID != userDID {
+			_, err = tx.Exec(`UPDATE convo_members SET unread_count = unread_count + 1 WHERE convo_id = ? AND user_did = ?`, convoID, memberDID)
+			if err != nil {
+				return nil, fmt.Errorf("error update member unread: %w", err)
+			}
+		}
+	}
+
 	err = tx.Commit()
 	if err != nil {
 		return nil, fmt.Errorf("error committing tx: %w", err)
 	}
 
 	return st.getMessage(convoID, id)
+}
+
+func (st Storage) resetUnread(convoID, userDID string, maybeMessageId *string) error {
+	var unreadCount int64
+	if maybeMessageId != nil {
+		// in this case we need to find how many messages are above the current message's cursor
+		var cursor int64
+		err := st.db.QueryRow(`SELECT cursor FROM convo_messages WHERE convo_id = ? AND message_id = ?`, convoID, *maybeMessageId).Scan(&cursor)
+		if err != nil {
+			return err
+		}
+		var count int64
+		err = st.db.QueryRow(`SELECT COUNT(*) from convo_messages WHERE convo_id = ? AND cursor > ?`, convoID, cursor).Scan(&count)
+		if err != nil {
+			return err
+		}
+
+		unreadCount = count
+	}
+
+	_, err := st.db.Exec(`UPDATE convo_members
+		SET unread_count = ?
+		WHERE convo_id = ? AND user_did = ?`, unreadCount, convoID, userDID)
+	return err
+
 }
 
 type State struct {
@@ -550,6 +594,12 @@ func (s State) updateRead(c *gin.Context) {
 		c.AbortWithError(http.StatusBadRequest, err)
 		return
 	}
+	err = s.storage.resetUnread(input.ConvoId, userDID, input.MessageId)
+	if err != nil {
+		c.AbortWithError(http.StatusInternalServerError, err)
+		return
+	}
+
 	convo, err := s.storage.getConvo(userDID, input.ConvoId)
 	if err != nil {
 		c.AbortWithError(http.StatusInternalServerError, err)
