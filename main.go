@@ -61,7 +61,7 @@ type Storage struct {
 }
 
 func (st Storage) hydrateEverything() error {
-	rows, err := st.db.Query("SELECT user_did FROM convo_members")
+	rows, err := st.db.Query("SELECT DISTINCT user_did FROM convo_members")
 	if err != nil {
 		return fmt.Errorf("error querying convo_members: %w", err)
 	}
@@ -96,8 +96,10 @@ func (st Storage) hydrateEverything() error {
 				if err != nil {
 					return fmt.Errorf("error parsing response body: %w", err)
 				}
-				handle = profile["handle"].(string)
-				_, err = st.db.Exec("INSERT INTO users (did, handle) VALUES (?, ?)", did, handle)
+				handle := profile["handle"].(string)
+				displayName := profile["displayName"].(string)
+				avatar := profile["avatar"].(string)
+				_, err = st.db.Exec("INSERT INTO users (did, handle, display_name, avatar) VALUES (?, ?, ?, ?)", did, handle, displayName, avatar)
 				if err != nil {
 					return fmt.Errorf("error inserting user: %w", err)
 				}
@@ -116,6 +118,22 @@ type ConvoMessage struct {
 	SentAt      time.Time
 	Deleted     bool
 	MessageData ConvoMessageData
+}
+
+type User struct {
+	DID         string
+	Handle      string
+	DisplayName string
+	AvatarURL   string
+}
+
+func (u User) asProfileBasic() *chat.ActorDefs_ProfileViewBasic {
+	return &chat.ActorDefs_ProfileViewBasic{
+		Did:         u.DID,
+		Handle:      u.Handle,
+		Avatar:      &u.AvatarURL,
+		DisplayName: &u.DisplayName,
+	}
 }
 
 type ConvoMessageData struct {
@@ -224,6 +242,16 @@ func (st Storage) getConvo(userDID, convoID string) (*chat.ConvoDefs_ConvoView, 
 	return nil, nil
 }
 
+func (st Storage) getUser(did string) (*User, error) {
+	var u User
+	u.DID = did
+	err := st.db.QueryRow("SELECT handle, display_name, avatar FROM users WHERE did = ?", did).Scan(&u.Handle, &u.DisplayName, &u.AvatarURL)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to scan user handle for member list: %v", err)
+	}
+	return &u, nil
+}
+
 func (st Storage) getAllConvos(userDID string) ([]*chat.ConvoDefs_ConvoView, error) {
 	rows, err := st.db.Query("SELECT convo_id FROM convo_members WHERE user_did = ?", userDID)
 	if err != nil {
@@ -265,15 +293,11 @@ func (st Storage) getAllConvos(userDID string) ([]*chat.ConvoDefs_ConvoView, err
 				return nil, fmt.Errorf("Failed to scan user did for member list: %v", err)
 			}
 			members = append(members, did)
-			var handle string
-			err = st.db.QueryRow("SELECT handle FROM users WHERE did = ?", did).Scan(&handle)
+			u, err := st.getUser(did)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to scan user handle for member list: %v", err)
+				return nil, fmt.Errorf("Failed to get user handle: %v", err)
 			}
-			view.Members = append(view.Members, &chat.ActorDefs_ProfileViewBasic{
-				Did:    did,
-				Handle: handle,
-			})
+			view.Members = append(view.Members, u.asProfileBasic())
 
 			if did == userDID {
 				// muted and unread is per-did
@@ -295,8 +319,6 @@ func (st Storage) getAllConvos(userDID string) ([]*chat.ConvoDefs_ConvoView, err
 			}
 		}
 	}
-	v, err := json.Marshal(views)
-	fmt.Println(string(v))
 	return views, nil
 }
 
@@ -642,7 +664,9 @@ func main() {
 
 	CREATE TABLE IF NOT EXISTS users (
 		did text primary key,
-		handle text
+		handle text,
+		display_name text,
+		avatar text
 	) STRICT;
 
 	CREATE TABLE IF NOT EXISTS convos (
